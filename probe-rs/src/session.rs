@@ -225,9 +225,8 @@ impl Session {
         match ap_information {
             MemoryAp(MemoryApInformation {
                 port_number,
-                only_32bit_data_size: _,
                 debug_base_address,
-                supports_hnonsec: _,
+                ..
             }) => {
                 let access_port_number = *port_number;
                 let base_address = *debug_base_address;
