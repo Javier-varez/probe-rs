@@ -69,7 +69,8 @@ impl JLink {
 
                 if self
                     .handle
-                    .available_interfaces().into_iter()
+                    .available_interfaces()
+                    .into_iter()
                     .any(|interface| interface == jlink_interface)
                 {
                     // We can select the desired interface
@@ -370,17 +371,11 @@ impl JLink {
         result
     }
 
-    fn send_swd_transaction(&mut self, sequence: SwdSequence) -> Result<u32, DebugProbeError> {
+    fn send_swd_transaction(&mut self, mut sequence: SwdSequence) -> Result<u32, DebugProbeError> {
         for retry in 0..5 {
             match sequence.transmit(&mut self.handle) {
                 Ok(value) => {
-                    if let TransferType::Write(_) =
-                        sequence.transfers.iter().last().unwrap().direction
-                    {
-                        log::debug!("DAP Write Ok");
-                    } else {
-                        log::debug!("DAP read {}.", value);
-                    }
+                    log::debug!("DAP transaction Ok");
                     return Ok(value);
                 }
                 Err(SwdTransmitError::ProtocolRelated(DapError::NoAcknowledge)) => {
@@ -646,7 +641,7 @@ impl SwdSequence {
         Ok(())
     }
 
-    fn transmit(&self, handle: &mut JayLink) -> Result<u32, SwdTransmitError> {
+    fn transmit(&mut self, handle: &mut JayLink) -> Result<u32, SwdTransmitError> {
         log::debug!(
             "Handling a SWD sequence with {:?} I/O transactions",
             self.transfers.len()
@@ -672,7 +667,13 @@ impl SwdSequence {
             }
         };
 
-        for transfer in self.transfers.iter() {
+        let mut read_result = 0;
+
+        for _ in 0..self.transfers.len() {
+            let transfer_offset = self.transfers[0].offset;
+            let transfer_length = self.transfers[0].length;
+            let transfer_direction = self.transfers[0].direction.clone();
+
             // We need to discard the output bits that correspond to the part of the request
             // in which the probe is driving SWDIO. Additionally, there is a phase shift that
             // happens when ownership of the SWDIO line is transfered to the device.
@@ -687,7 +688,7 @@ impl SwdSequence {
 
             // Get the ack.
             let ack = result_sequence.split_off(3).collect::<Vec<_>>();
-            log::debug!("Ack bits from offset {:?}: {:?}", transfer.offset, ack);
+            log::debug!("Ack bits from offset {:?}: {:?}", transfer_offset, ack);
 
             // When all bits are high, this means we didn't get any response from the
             // target, which indicates a protocol error.
@@ -699,41 +700,45 @@ impl SwdSequence {
                 return Err(SwdTransmitError::ProtocolRelated(DapError::FaultResponse));
             }
 
-            match transfer.direction {
+            match transfer_direction {
                 TransferType::Read => {
                     // Take the data bits and convert them into a 32bit int.
                     // This data will ONLY be valid in case the transaction was a read
                     let register_val = result_sequence.split_off(32);
                     let value = bits_to_byte(register_val);
 
-                    // Since reads cannot be batched, we always return here, even if the sequence
-                    // is not done. It is up to the user to verify that only one read is enqued
-                    // to the end of the queue.
-
                     // Make sure the parity is correct.
-                    return result_sequence
-                        .next()
-                        .and_then(|parity| {
-                            if (value.count_ones() % 2 == 1) == parity {
-                                Some(value)
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| {
-                            SwdTransmitError::ProtocolRelated(DapError::IncorrectParity.into())
-                        });
+                    if let Some(parity) = result_sequence.next() {
+                        if (value.count_ones() % 2 == 1) == parity {
+                            read_result = value;
+                        } else {
+                            return Err(SwdTransmitError::ProtocolRelated(
+                                DapError::IncorrectParity.into(),
+                            ));
+                        }
+                    } else {
+                        return Err(SwdTransmitError::ProtocolRelated(
+                            DapError::IncorrectParity.into(),
+                        ));
+                    }
 
                     // Don't care about the Trn bit at the end.
                 }
                 _ => {
                     // Remove bits for this transaction
-                    result_sequence.split_off(transfer.length - 2 - 8 - 3);
+                    result_sequence.split_off(transfer_length - 2 - 8 - 3);
                 }
             }
+
+            // Since the current transfer was ok, we can go ahead and remove it from the queue
+            // This ensures that if we return, only the unsuccesful part of the queue will be present
+            // for the retry
+            self.transfers.remove(0);
+            self.io_seq.drain(0..transfer_length);
+            self.dir_seq.drain(0..transfer_length);
         }
 
-        Ok(0)
+        Ok(read_result)
     }
 }
 
