@@ -56,7 +56,7 @@ impl JLink {
         &mut self,
         protocol: Option<WireProtocol>,
     ) -> Result<WireProtocol, DebugProbeError> {
-        let capabilities = self.handle.read_capabilities()?;
+        let capabilities = self.handle.capabilities();
 
         if capabilities.contains(jaylink::Capabilities::SELECT_IF) {
             if let Some(protocol) = protocol {
@@ -67,7 +67,7 @@ impl JLink {
 
                 if self
                     .handle
-                    .read_available_interfaces()?
+                    .available_interfaces().into_iter()
                     .any(|interface| interface == jlink_interface)
                 {
                     // We can select the desired interface
@@ -78,7 +78,7 @@ impl JLink {
                 }
             } else {
                 // No special protocol request
-                let current_protocol = self.handle.read_current_interface()?;
+                let current_protocol = self.handle.current_interface();
 
                 match current_protocol {
                     jaylink::Interface::Swd => Ok(WireProtocol::Swd),
@@ -414,10 +414,10 @@ impl DebugProbe for JLink {
         // not be able to change protocols.
 
         let supported_protocols: Vec<WireProtocol> = if jlink_handle
-            .read_capabilities()?
+            .capabilities()
             .contains(jaylink::Capabilities::SELECT_IF)
         {
-            let interfaces = jlink_handle.read_available_interfaces()?;
+            let interfaces = jlink_handle.available_interfaces().into_iter();
 
             let protocols: Vec<_> = interfaces.map(WireProtocol::try_from).collect();
 
@@ -528,7 +528,7 @@ impl DebugProbe for JLink {
         log::debug!("Attaching with protocol '{}'", actual_protocol);
 
         // Get reference to JayLink instance
-        let capabilities = self.handle.read_capabilities()?;
+        let capabilities = self.handle.capabilities();
 
         // Log some information about the probe
         let serial = self.handle.serial_string().trim_start_matches('0');
