@@ -45,6 +45,8 @@ pub(crate) struct JLink {
     current_ir_reg: u32,
 
     speed_khz: u32,
+
+    batch: Option<SwdSequence>,
 }
 
 impl JLink {
@@ -327,11 +329,8 @@ impl JLink {
         let mut swd_io = vec![true; 50];
         let mut direction = vec![true; 50];
 
-        let SwdSequence {
-            io_seq: register_io,
-            dir_seq: register_direction,
-            ..
-        } = SwdSequence::build_from_command(PortType::DebugPort, TransferType::Read, 0);
+        let (register_io, register_direction) =
+            SwdSequence::build_raw_sequences(&PortType::DebugPort, &TransferType::Read, 0);
 
         swd_io.extend_from_slice(&register_io);
         direction.extend_from_slice(&register_direction);
@@ -371,24 +370,21 @@ impl JLink {
         result
     }
 
-    /// Performs a SWD read or write transaction
-    /// So far it does not perform any batching. This will be implemented later.
-    fn swd_transaction(
-        &mut self,
-        port: PortType,
-        transfer_type: TransferType,
-        address: u16,
-    ) -> Result<u32, DebugProbeError> {
-        let sequence = SwdSequence::build_from_command(port, transfer_type, address);
-
+    fn send_swd_transaction(&mut self, sequence: SwdSequence) -> Result<u32, DebugProbeError> {
         for retry in 0..5 {
             match sequence.transmit(&mut self.handle) {
                 Ok(value) => {
-                    log::trace!("DAP read {}.", value);
+                    if let TransferType::Write(_) =
+                        sequence.transfers.iter().last().unwrap().direction
+                    {
+                        log::debug!("DAP Write Ok");
+                    } else {
+                        log::debug!("DAP read {}.", value);
+                    }
                     return Ok(value);
                 }
                 Err(SwdTransmitError::ProtocolRelated(DapError::NoAcknowledge)) => {
-                    log::debug!("DAP NACK");
+                    log::warn!("DAP NACK");
 
                     // Because we clock the SWDCLK line after receving the WAIT response,
                     // the target might be in weird state. If we perform a line reset,
@@ -417,7 +413,7 @@ impl JLink {
                     continue;
                 }
                 Err(SwdTransmitError::ProtocolRelated(DapError::FaultResponse)) => {
-                    log::debug!("DAP FAULT");
+                    log::warn!("DAP FAULT");
                     // A fault happened during operation.
 
                     // To get a clue about the actual fault we read the ctrl register,
@@ -454,21 +450,22 @@ impl JLink {
                     return Err(DapError::FaultResponse.into());
                 }
                 Err(SwdTransmitError::ProtocolRelated(DapError::IncorrectParity)) => {
-                    log::error!("DAP read fault.");
+                    log::warn!("DAP read fault.");
                     return Err(DapError::IncorrectParity.into());
                 }
                 Err(SwdTransmitError::ProtocolRelated(error)) => {
+                    log::warn!("DAP other protocol-related error");
                     return Err(error.into());
                 }
                 Err(SwdTransmitError::ProbeRelated(error)) => {
-                    log::error!("DAP JLink Probe I/O error.");
+                    log::warn!("DAP JLink Probe I/O error.");
                     return Err(error);
                 }
             }
         }
 
         // If we land here, the DAP operation timed out.
-        log::error!("DAP read timeout.");
+        log::warn!("DAP read timeout.");
         Err(DebugProbeError::Timeout)
     }
 }
@@ -478,20 +475,34 @@ enum SwdTransmitError {
     ProtocolRelated(DapError),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum TransferType {
     Read,
     Write(u32),
 }
 
+#[derive(Debug)]
+struct SwdTransfer {
+    port: PortType,
+    direction: TransferType,
+    address: u16,
+    offset: usize,
+    length: usize,
+}
+
+#[derive(Debug)]
 struct SwdSequence {
     io_seq: Vec<bool>,
     dir_seq: Vec<bool>,
-    direction_rnw: bool,
+    transfers: Vec<SwdTransfer>,
 }
 
 impl SwdSequence {
-    fn build_from_command(port: PortType, direction: TransferType, address: u16) -> Self {
+    fn build_raw_sequences(
+        port: &PortType,
+        direction: &TransferType,
+        address: u16,
+    ) -> (Vec<bool>, Vec<bool>) {
         // JLink operates on raw SWD bit sequences.
         // So we need to manually assemble the read and write bitsequences.
         // The following code with the comments hopefully explains well enough how it works.
@@ -499,13 +510,13 @@ impl SwdSequence {
         // `true` means `drive line` and `false` means `open drain` for the direction sequence.
 
         // First we determine the APnDP bit.
-        let port = match port {
+        let port_bit = match port {
             PortType::DebugPort => false,
             PortType::AccessPort(_) => true,
         };
 
         // Set direction bit to 1 for reads.
-        let direction_bit = direction == TransferType::Read;
+        let direction_bit = *direction == TransferType::Read;
 
         // Then we determine the address bits.
         // Only bits 2 and 3 are relevant as we use byte addressing but can only read 32bits
@@ -519,18 +530,18 @@ impl SwdSequence {
             false, // Line idle.
             false, // Line idle.
             // Then we assemble the actual request.
-            true,                           // Start bit (always 1).
-            port,                           // APnDP (0 for DP, 1 for AP).
-            direction_bit,                  // RnW (0 for Write, 1 for Read).
-            a2,                             // Address bit 2.
-            a3,                             // Address bit 3,
-            port ^ direction_bit ^ a2 ^ a3, // Odd parity bit over APnDP, RnW a2 and a3
-            false,                          // Stop bit (always 0).
-            true,                           // Park bit (always 1).
-            false,                          // Turnaround bit.
-            false,                          // ACK bit.
-            false,                          // ACK bit.
-            false,                          // ACK bit.
+            true,                               // Start bit (always 1).
+            port_bit,                           // APnDP (0 for DP, 1 for AP).
+            direction_bit,                      // RnW (0 for Write, 1 for Read).
+            a2,                                 // Address bit 2.
+            a3,                                 // Address bit 3,
+            port_bit ^ direction_bit ^ a2 ^ a3, // Odd parity bit over APnDP, RnW a2 and a3
+            false,                              // Stop bit (always 0).
+            true,                               // Park bit (always 1).
+            false,                              // Turnaround bit.
+            false,                              // ACK bit.
+            false,                              // ACK bit.
+            false,                              // ACK bit.
         ];
 
         if let TransferType::Write(mut value) = direction {
@@ -566,7 +577,7 @@ impl SwdSequence {
             .chain(iter::repeat(false).take(1)) // Turnaround bit
             .chain(iter::repeat(false).take(3)); // Receive 3 Ack bits.
 
-        let direction_sequence: Vec<bool> = if direction == TransferType::Read {
+        let direction_sequence: Vec<bool> = if *direction == TransferType::Read {
             direction_sequence
                 .chain(iter::repeat(false).take(32)) // Receive 32 Data bits.
                 .chain(iter::repeat(false).take(1)) // Receive 1 Parity bit.
@@ -586,14 +597,60 @@ impl SwdSequence {
             "IO and direction sequences need to have the same length."
         );
 
+        (swd_io_sequence, direction_sequence)
+    }
+
+    fn build_from_command(port: PortType, direction: TransferType, address: u16) -> Self {
+        let (io_seq, dir_seq) = SwdSequence::build_raw_sequences(&port, &direction, address);
+        let sequence_length = io_seq.len();
         Self {
-            io_seq: swd_io_sequence,
-            dir_seq: direction_sequence,
-            direction_rnw: direction_bit,
+            io_seq,
+            dir_seq,
+            transfers: vec![SwdTransfer {
+                address,
+                direction,
+                port,
+                length: sequence_length,
+                offset: 0usize,
+            }],
         }
     }
 
+    fn append(
+        &mut self,
+        port: &PortType,
+        direction: &TransferType,
+        address: u16,
+    ) -> Result<(), ()> {
+        let (io_seq, dir_seq) = SwdSequence::build_raw_sequences(port, direction, address);
+        let sequence_length = io_seq.len();
+        let offset = self.io_seq.len();
+
+        let overhead_bits = 8;
+        let max_bits_per_batch = 2048 * 8;
+        if self.io_seq.len() + sequence_length + overhead_bits > max_bits_per_batch {
+            log::debug!("Maximum buffer size exceeded, can't attach a new sequence");
+            return Err(());
+        }
+
+        self.io_seq.extend(io_seq);
+        self.dir_seq.extend(dir_seq);
+        self.transfers.push(SwdTransfer {
+            address,
+            direction: direction.clone(),
+            port: port.clone(),
+            length: sequence_length,
+            offset,
+        });
+
+        Ok(())
+    }
+
     fn transmit(&self, handle: &mut JayLink) -> Result<u32, SwdTransmitError> {
+        log::debug!(
+            "Handling a SWD sequence with {:?} I/O transactions",
+            self.transfers.len()
+        );
         // Add 8 idle cycles to ensure the write is performed.
         // See section B4.1.1 in the ARM Debug Interface specification.
         let dir_seq = self
@@ -615,52 +672,65 @@ impl SwdSequence {
             }
         };
 
-        // We need to discard the output bits that correspond to the part of the request
-        // in which the probe is driving SWDIO. Additionally, there is a phase shift that
-        // happens when ownership of the SWDIO line is transfered to the device.
-        // The device changes the value of SWDIO with the rising edge of the clock.
-        //
-        // It appears that the JLink probe samples this line with the falling edge of
-        // the clock. Therefore, the whole sequence seems to be leading by one bit,
-        // which is why we don't discard the turnaround bit. It actually contains the
-        // first ack bit.
-        result_sequence.split_off(2); // Idle bits
-        result_sequence.split_off(8); // Request bits
+        for transfer in self.transfers.iter() {
+            // We need to discard the output bits that correspond to the part of the request
+            // in which the probe is driving SWDIO. Additionally, there is a phase shift that
+            // happens when ownership of the SWDIO line is transfered to the device.
+            // The device changes the value of SWDIO with the rising edge of the clock.
+            //
+            // It appears that the JLink probe samples this line with the falling edge of
+            // the clock. Therefore, the whole sequence seems to be leading by one bit,
+            // which is why we don't discard the turnaround bit. It actually contains the
+            // first ack bit.
+            result_sequence.split_off(2); // Idle bits
+            result_sequence.split_off(8); // Request bits
 
-        // Get the ack.
-        let ack = result_sequence.split_off(3).collect::<Vec<_>>();
+            // Get the ack.
+            let ack = result_sequence.split_off(3).collect::<Vec<_>>();
+            log::debug!("Ack bits from offset {:?}: {:?}", transfer.offset, ack);
 
-        // When all bits are high, this means we didn't get any response from the
-        // target, which indicates a protocol error.
-        if ack[0] && ack[1] && ack[2] {
-            return Err(SwdTransmitError::ProtocolRelated(DapError::NoAcknowledge));
-        } else if ack[1] {
-            return Err(SwdTransmitError::ProtocolRelated(DapError::WaitResponse));
-        } else if ack[2] {
-            return Err(SwdTransmitError::ProtocolRelated(DapError::FaultResponse));
-        }
+            // When all bits are high, this means we didn't get any response from the
+            // target, which indicates a protocol error.
+            if ack[0] && ack[1] && ack[2] {
+                return Err(SwdTransmitError::ProtocolRelated(DapError::NoAcknowledge));
+            } else if ack[1] {
+                return Err(SwdTransmitError::ProtocolRelated(DapError::WaitResponse));
+            } else if ack[2] {
+                return Err(SwdTransmitError::ProtocolRelated(DapError::FaultResponse));
+            }
 
-        if self.direction_rnw {
-            // Take the data bits and convert them into a 32bit int.
-            // This data will ONLY be valid in case the transaction was a read
-            let register_val = result_sequence.split_off(32);
-            let value = bits_to_byte(register_val);
+            match transfer.direction {
+                TransferType::Read => {
+                    // Take the data bits and convert them into a 32bit int.
+                    // This data will ONLY be valid in case the transaction was a read
+                    let register_val = result_sequence.split_off(32);
+                    let value = bits_to_byte(register_val);
 
-            // Make sure the parity is correct.
-            return result_sequence
-                .next()
-                .and_then(|parity| {
-                    if (value.count_ones() % 2 == 1) == parity {
-                        Some(value)
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| {
-                    SwdTransmitError::ProtocolRelated(DapError::IncorrectParity.into())
-                });
+                    // Since reads cannot be batched, we always return here, even if the sequence
+                    // is not done. It is up to the user to verify that only one read is enqued
+                    // to the end of the queue.
 
-            // Don't care about the Trn bit at the end.
+                    // Make sure the parity is correct.
+                    return result_sequence
+                        .next()
+                        .and_then(|parity| {
+                            if (value.count_ones() % 2 == 1) == parity {
+                                Some(value)
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| {
+                            SwdTransmitError::ProtocolRelated(DapError::IncorrectParity.into())
+                        });
+
+                    // Don't care about the Trn bit at the end.
+                }
+                _ => {
+                    // Remove bits for this transaction
+                    result_sequence.split_off(transfer.length - 2 - 8 - 3);
+                }
+            }
         }
 
         Ok(0)
@@ -748,6 +818,7 @@ impl DebugProbe for JLink {
             protocol: None,
             current_ir_reg: 1,
             speed_khz: 0,
+            batch: None,
         }))
     }
 
@@ -916,7 +987,11 @@ impl DebugProbe for JLink {
     }
 
     fn detach(&mut self) -> Result<(), super::DebugProbeError> {
-        unimplemented!()
+        if let Some(sequence) = self.batch.take() {
+            self.send_swd_transaction(sequence)?;
+        }
+
+        Ok(())
     }
 
     fn target_reset(&mut self) -> Result<(), super::DebugProbeError> {
@@ -1046,7 +1121,19 @@ impl DAPAccess for JLink {
             _ => false,
         };
 
-        match self.swd_transaction(port, TransferType::Read, address) {
+        let direction = TransferType::Read;
+
+        if let Some(sequence) = self.batch.take() {
+            log::debug!("DAP Sending batch before read operation");
+            self.send_swd_transaction(sequence)?;
+            self.batch = Some(SwdSequence::build_from_command(port, direction, address));
+        } else {
+            self.batch = Some(SwdSequence::build_from_command(port, direction, address));
+        }
+
+        // We take ownership of the batch here and then send the transaction
+        let sequence = self.batch.take().unwrap();
+        match self.send_swd_transaction(sequence) {
             // If we are reading an AP register we only get the actual result in the next transaction.
             // So we issue a special transaction to get the read value.
             Ok(_) if is_ap_port => {
@@ -1064,8 +1151,24 @@ impl DAPAccess for JLink {
         address: u16,
         value: u32,
     ) -> Result<(), DebugProbeError> {
-        self.swd_transaction(port, TransferType::Write(value), address)
-            .map(|_| ())
+        let direction = TransferType::Write(value);
+
+        if let Some(mut sequence) = self.batch.take() {
+            match sequence.append(&port, &direction, address) {
+                Err(_) => {
+                    // No space to append the transaction, we need to send the batch as is
+                    self.send_swd_transaction(sequence)?;
+                    self.batch = Some(SwdSequence::build_from_command(port, direction, address));
+                }
+                Ok(_) => {
+                    self.batch = Some(sequence);
+                }
+            };
+        } else {
+            self.batch = Some(SwdSequence::build_from_command(port, direction, address));
+        }
+
+        Ok(())
     }
 
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
